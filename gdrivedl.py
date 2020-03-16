@@ -7,23 +7,28 @@ import os
 try:
     #Python3
     from urllib.request import Request, urlopen
+    from queue import Queue
 except:
     #python2
     from urllib2 import Request, urlopen
+    from Queue import Queue
+
+from threading import Thread
 
 ITEM_URL        = 'https://drive.google.com/open?id={id}'
 FILE_URL        = 'https://docs.google.com/uc?export=download&id={id}&confirm={confirm}'
 FOLDER_URL      = 'https://drive.google.com/drive/folders/{id}'
 
 ID_PATTERNS     = [
-    re.compile('/file/d/([0-9A-Za-z_-]{10,})(?:/|$)', re.IGNORECASE), 
-    re.compile('id=([0-9A-Za-z_-]{10,})(?:&|$)', re.IGNORECASE), 
-    re.compile('([0-9A-Za-z_-]{10,})', re.IGNORECASE)
+    re.compile('/file/d/([0-9a-z_-]{10,})(?:/|$)', re.IGNORECASE), 
+    re.compile('id=([0-9a-z_-]{10,})(?:&|$)', re.IGNORECASE), 
+    re.compile('([0-9a-z_-]{10,})', re.IGNORECASE)
 ]
 FILE_PATTERN    = re.compile("itemJson: (\[.*?);</script>", re.DOTALL|re.IGNORECASE)
 FOLDER_PATTERN  = re.compile("window\['_DRIVE_ivd'\] = '(.*?)';", re.DOTALL|re.IGNORECASE)
 CONFIRM_PATTERN = re.compile("download_warning[0-9A-Za-z_-]+=([0-9A-Za-z_-]+);", re.IGNORECASE)
 FOLDER_TYPE     = 'application/vnd.google-apps.folder'
+WORKERS         = 5
 
 def safe_filename(filename):
     return re.sub(r'[^.=_ \w\d-]', '_', filename)
@@ -35,6 +40,9 @@ def process_item(id, directory):
     url  = resp.geturl()
     html = resp.read().decode('utf-8')
 
+    folder_queue = Queue()
+    file_queue   = Queue()
+
     if '/file/' in url:
         match = FILE_PATTERN.search(html)
         data  = match.group(1).replace('\/', '/').rstrip('}').strip()
@@ -44,11 +52,10 @@ def process_item(id, directory):
         file_name = safe_filename(data[1])
         file_size = int(data[25][2])
         file_path = os.path.join(directory, file_name)
-
-        process_file(id, file_path, file_size)
+        file_queue.put({'id': id, 'file_path': file_path, 'file_size': file_size})
 
     elif '/folders/' in url:
-        process_folder(id, directory, html=html)
+        folder_queue.put({'id': id, 'directory': directory, 'html': html})
     elif 'ServiceLogin' in url:
         sys.stderr.write('Id {} does not have link sharing enabled'.format(id))
         sys.exit(1)
@@ -56,7 +63,34 @@ def process_item(id, directory):
         sys.stderr.write('That id {} returned an unknown url'.format(id))
         sys.exit(1)
 
-def process_folder(id, directory, html=None):    
+    def worker():
+        while True:
+            item = folder_queue.get()
+            item.update({'file_queue': file_queue, 'folder_queue': folder_queue})
+            process_folder(**item)
+            folder_queue.task_done()
+
+    for i in range(WORKERS):
+        t = Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+    folder_queue.join()
+
+    def worker():
+        while True:
+            item = file_queue.get()
+            process_file(**item)
+            file_queue.task_done()
+
+    for i in range(WORKERS):
+        t = Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+    file_queue.join()
+
+def process_folder(id, directory, file_queue, folder_queue, html=None):    
     if not html:
         url  = FOLDER_URL.format(id=id)
         html = urlopen(url).read().decode('utf-8')
@@ -83,10 +117,9 @@ def process_folder(id, directory, html=None):
         item_path = os.path.join(directory, item_name)
         
         if item_type == FOLDER_TYPE:
-            process_folder(item_id, item_path)
+            folder_queue.put({'id': item_id, 'directory': item_path})
         else:
-            process_file(item_id, item_path, int(item_size))
-            sys.stdout.write('\n')
+            file_queue.put({'id': item_id, 'file_path': item_path, 'file_size': item_size})
 
 def process_file(id, file_path, file_size, confirm='', cookies=''):
     if os.path.exists(file_path):
@@ -101,7 +134,7 @@ def process_file(id, file_path, file_size, confirm='', cookies=''):
     if not confirm and 'download_warning' in cookies:
         confirm = CONFIRM_PATTERN.search(cookies)
         return process_file(id, file_path, file_size, confirm.group(1), cookies)
-
+    
     sys.stdout.write(file_path+'\n')
 
     try:
